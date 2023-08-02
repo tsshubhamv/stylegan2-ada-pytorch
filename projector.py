@@ -19,6 +19,12 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+# for scoreneti 
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+
 import dnnlib
 import legacy
 
@@ -130,6 +136,147 @@ def project(
 
     return w_out.repeat([1, G.mapping.num_ws, 1])
 
+
+# constants for scorenetsi
+num_classes_sn = 4 # this would be 4 in ideal scenario
+# classlabels_sn = [
+#         1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+#     ]
+classlabels_sn = [
+         5, 6, 7, 8
+    ]
+input_size_sn = 256
+
+def load_scorenet(device: torch.device):
+    # Load the trained model
+    model = models.resnet50(pretrained=False)
+    num_ftrs = model.fc.in_features
+    
+    model.fc = nn.Linear(num_ftrs, num_classes_sn)
+    model.load_state_dict(torch.load('/content/drive/MyDrive/ML/image_classification_model_epoch100.pt'))
+    model.eval()
+
+    # Set the device for inference
+    model = model.to(device)
+    return model
+
+
+def predict_maloclusion(scorenet, image, device):
+    
+    # Define the transformation for input images
+    transform = transforms.Compose([
+        transforms.Resize((input_size_sn, input_size_sn)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    image = transform(image).unsqueeze(0).to(device)
+    output = scorenet(image)
+    _, pred = torch.max(output, 1)
+    class_index = pred.item()
+    malscore = classlabels_sn[class_index-1]
+    print("malscore", malscore)
+    return malscore
+
+
+
+
+def correct(
+        G,
+    target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
+    *,
+    num_steps                  = 200,
+    w_inv,
+    initial_learning_rate      = 0.1,
+    initial_noise_factor       = 0.05,
+    lr_rampdown_length         = 0.25,
+    lr_rampup_length           = 0.05,
+    noise_ramp_length          = 0.75,
+    regularize_noise_weight    = 1e5,
+    verbose                    = False,
+    device: torch.device
+):
+    assert target.shape == (G.img_channels, G.img_resolution, G.img_resolution)
+
+    def logprint(*args):
+        if verbose:
+            print(*args)
+
+    G = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
+
+    # Setup noise inputs.
+    noise_bufs = { name: buf for (name, buf) in G.synthesis.named_buffers() if 'noise_const' in name }
+
+    # Load scorenet maloclusion detector.
+    scorenet = load_scorenet(device)
+    def predict_maloclusion_local(image):
+        predict_maloclusion(scorenet=scorenet, image=image, device=device)
+
+
+    # instead of using w_avg we are using w_inv which is the inverse output
+    w_opt = torch.tensor(w_inv, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
+    optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
+
+    # Init noise.
+    for buf in noise_bufs.values():
+        buf[:] = torch.randn_like(buf)
+        buf.requires_grad = True
+
+    for step in range(num_steps):
+        # Learning rate schedule.
+        t = step / num_steps
+        w_noise_scale = w_opt * initial_noise_factor * max(0.0, 1.0 - t / noise_ramp_length) ** 2
+        lr_ramp = min(1.0, (1.0 - t) / lr_rampdown_length)
+        lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
+        lr_ramp = lr_ramp * min(1.0, t / lr_rampup_length)
+        lr = initial_learning_rate * lr_ramp
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+
+        # Synth images from opt_w.
+        w_noise = torch.randn_like(w_opt) * w_noise_scale
+        ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        synth_images = G.synthesis(ws, noise_mode='const')
+
+        # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
+        synth_images = (synth_images + 1) * (255/2)
+        if synth_images.shape[2] > 256:
+            synth_images = F.interpolate(synth_images, size=(256, 256), mode='area')
+
+        synth_score = predict_maloclusion_local(synth_images)
+
+        # Noise regularization.
+        reg_loss = 0.0
+        for v in noise_bufs.values():
+            noise = v[None,None,:,:] # must be [1,1,H,W] for F.avg_pool2d()
+            while True:
+                reg_loss += (noise*torch.roll(noise, shifts=1, dims=3)).mean()**2
+                reg_loss += (noise*torch.roll(noise, shifts=1, dims=2)).mean()**2
+                if noise.shape[2] <= 8:
+                    break
+                noise = F.avg_pool2d(noise, kernel_size=2)
+        loss = synth_score + reg_loss * regularize_noise_weight
+
+                # Step
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        logprint(f'step {step+1:>4d}/{num_steps}: maloclusion_score {synth_score:<4.2f} loss {float(loss):<5.2f}')
+
+        # Save projected W for each optimization step.
+        w_out[step] = w_opt.detach()[0]
+
+        # Normalize noise.
+        with torch.no_grad():
+            for buf in noise_bufs.values():
+                buf -= buf.mean()
+                buf *= buf.square().mean().rsqrt()
+
+    return w_out.repeat([1, G.mapping.num_ws, 1])
+
+
+
 #----------------------------------------------------------------------------
 
 @click.command()
@@ -139,13 +286,15 @@ def project(
 @click.option('--seed',                   help='Random seed', type=int, default=303, show_default=True)
 @click.option('--save-video',             help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
 @click.option('--outdir',                 help='Where to save the output images', required=True, metavar='DIR')
+@click.option('--correct-teeth',                 help='Correct the teeth of given image', type=bool, default=True, show_default=True)
 def run_projection(
     network_pkl: str,
     target_fname: str,
     outdir: str,
     save_video: bool,
     seed: int,
-    num_steps: int
+    num_steps: int,
+    correct_teeth: bool,
 ):
     """Project given image to the latent space of pretrained network pickle.
 
@@ -189,6 +338,19 @@ def run_projection(
     # Save final projected frame and W vector.
     target_pil.save(f'{outdir}/target.png')
     projected_w = projected_w_steps[-1]
+
+    if correct_teeth:
+        output = correct(
+            G,
+            target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
+            num_steps=200,
+            device=device,
+            verbose=True,
+            w_inv=projected_w
+        )
+        print(output.shape)
+
+
     synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
     synth_image = (synth_image + 1) * (255/2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
