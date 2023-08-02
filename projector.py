@@ -346,7 +346,7 @@ def run_projection(
             num_steps=200,
             device=device,
             verbose=True,
-            w_inv=projected_w
+            w_inv=projected_w.unsqueeze(0)
         )
         print(output.shape)
 
