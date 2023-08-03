@@ -19,7 +19,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
-# for scoreneti 
+# for scoreneti
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -56,6 +56,7 @@ def project(
     z_samples = np.random.RandomState(123).randn(w_avg_samples, G.z_dim)
     w_samples = G.mapping(torch.from_numpy(z_samples).to(device), None)  # [N, L, C]
     w_samples = w_samples[:, :1, :].cpu().numpy().astype(np.float32)       # [N, 1, C]
+    print("projection w_avg", w_samples.shape)
     w_avg = np.mean(w_samples, axis=0, keepdims=True)      # [1, 1, C]
     w_std = (np.sum((w_samples - w_avg) ** 2) / w_avg_samples) ** 0.5
 
@@ -76,6 +77,7 @@ def project(
     w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
     w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
+    print("projection: shapes", w_opt.shape, w_out.shape)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -95,7 +97,9 @@ def project(
 
         # Synth images from opt_w.
         w_noise = torch.randn_like(w_opt) * w_noise_scale
+        print("projection: w_noise", w_noise.shape)
         ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        print("projection: ws", ws.shape)
         synth_images = G.synthesis(ws, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
@@ -106,6 +110,8 @@ def project(
         # Features for synth images.
         synth_features = vgg16(synth_images, resize_images=False, return_lpips=True)
         dist = (target_features - synth_features).square().sum()
+
+        print(dist)
 
         # Noise regularization.
         reg_loss = 0.0
@@ -151,7 +157,7 @@ def load_scorenet(device: torch.device):
     # Load the trained model
     model = models.resnet50(pretrained=False)
     num_ftrs = model.fc.in_features
-    
+
     model.fc = nn.Linear(num_ftrs, num_classes_sn)
     model.load_state_dict(torch.load('/content/drive/MyDrive/ML/image_classification_model_epoch100.pt'))
     model.eval()
@@ -162,11 +168,11 @@ def load_scorenet(device: torch.device):
 
 
 def predict_maloclusion(scorenet, image, device):
-    
+
     # Define the transformation for input images
     transform = transforms.Compose([
-        transforms.Resize((input_size_sn, input_size_sn)),
-        transforms.ToTensor(),
+        # transforms.Resize((input_size_sn, input_size_sn)),
+        # transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     image = transform(image).unsqueeze(0).to(device)
@@ -184,7 +190,7 @@ def correct(
         G,
     target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
     *,
-    num_steps                  = 200,
+    num_steps                  = 50,
     w_inv,
     initial_learning_rate      = 0.1,
     initial_noise_factor       = 0.05,
@@ -209,13 +215,19 @@ def correct(
     # Load scorenet maloclusion detector.
     scorenet = load_scorenet(device)
     def predict_maloclusion_local(image):
-        predict_maloclusion(scorenet=scorenet, image=image, device=device)
+       return predict_maloclusion(scorenet=scorenet, image=image, device=device)
 
 
     # instead of using w_avg we are using w_inv which is the inverse output
-    w_opt = torch.tensor(w_inv, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    # w_opt = torch.tensor(w_inv, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    w_avg = np.mean(w_inv.clone().cpu().numpy(), axis=1, keepdims=True)
+    w_int = np.split(w_avg, [4, 10])
+    print(w_int[0].shape, w_int[1].shape, w_int[2].shape)
+    w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)
+    # w_opt = w_inv.clone().detach().requires_grad_(True)
     w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
+    print("correct shapes:", w_opt.shape, w_out.shape)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -236,7 +248,9 @@ def correct(
 
         # Synth images from opt_w.
         w_noise = torch.randn_like(w_opt) * w_noise_scale
+        print("correct: w_noise.shape", w_noise.shape)
         ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        print("correct: ws", ws)
         synth_images = G.synthesis(ws, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
@@ -244,7 +258,8 @@ def correct(
         if synth_images.shape[2] > 256:
             synth_images = F.interpolate(synth_images, size=(256, 256), mode='area')
 
-        synth_score = predict_maloclusion_local(synth_images)
+        synth_score = torch.tensor(predict_maloclusion_local(torch.squeeze(synth_images)) * 10)
+        print("synth_score", synth_score)
 
         # Noise regularization.
         reg_loss = 0.0
@@ -340,7 +355,8 @@ def run_projection(
     projected_w = projected_w_steps[-1]
 
     if correct_teeth:
-        output = correct(
+        print(projected_w.unsqueeze(0).shape)
+        projected_w_steps = correct(
             G,
             target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
             num_steps=200,
@@ -348,7 +364,9 @@ def run_projection(
             verbose=True,
             w_inv=projected_w.unsqueeze(0)
         )
-        print(output.shape)
+        print(projected_w_steps.shape)
+
+    projected_w = projected_w_steps[-1]
 
 
     synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
@@ -368,8 +386,7 @@ def run_projection(
             video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
         video.close()
 
-#----------------------------------------------------------------------------
-
+# python /content/stylegan2-ada-pytorch/projector.py --seed 303 --save-video 1 --num-steps 300 --outdir={OUT} --target={SOURCE_NAME} --network={STYLEGAN2_PKL_URL}
 if __name__ == "__main__":
     run_projection() # pylint: disable=no-value-for-parameter
 
